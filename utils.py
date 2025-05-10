@@ -41,6 +41,17 @@ def process_data(data: List[Dict], transformations: Optional[Dict] = None) -> pd
             if column in df.columns:
                 df[column] = df[column].apply(transform_func)
 
+    # Truncate any string columns that are too long for Excel (Excel has a 32,767 character limit)
+    for column in df.columns:
+        if df[column].dtype == 'object':  # Check if it's a string/object column
+            # Truncate text to 32000 characters to be safe
+            df[column] = df[column].astype(str).apply(lambda x: x[:32000] if len(x) > 32000 else x)
+
+            # Log if any values were truncated
+            max_len = df[column].astype(str).apply(len).max()
+            if max_len > 32000:
+                logger.warning(f"Column '{column}' had values truncated from {max_len} to 32000 characters")
+
     return df
 
 
@@ -86,14 +97,40 @@ def save_to_excel(
 
     file_path = os.path.join(output_dir, full_filename)
 
-    # Save to Excel
-    try:
-        df.to_excel(file_path, sheet_name=sheet_name, index=False, engine=config.EXCEL_ENGINE)
-        logger.info(f"Data exported to {file_path}")
-        return file_path
-    except Exception as e:
-        logger.error(f"Failed to export data to Excel: {str(e)}")
-        return ""
+    # Replace problematic characters in string columns
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            # Replace illegal Excel characters with spaces
+            df[col] = df[col].astype(str).apply(
+                lambda x: x.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ')
+            )
+
+    # Try different Excel engines if the default one fails
+    engines = [config.EXCEL_ENGINE, 'xlsxwriter', 'openpyxl']
+
+    for engine in engines:
+        try:
+            # Save to Excel
+            df.to_excel(file_path, sheet_name=sheet_name, index=False, engine=engine)
+            logger.info(f"Data exported to {file_path} using {engine} engine")
+            return file_path
+        except Exception as e:
+            if engine == engines[-1]:  # If we've tried all engines
+                logger.error(f"Failed to export data to Excel with all engines: {str(e)}")
+
+                # Fall back to CSV as a last resort
+                try:
+                    csv_file_path = file_path.replace('.xlsx', '.csv')
+                    df.to_csv(csv_file_path, index=False)
+                    logger.info(f"Data exported to CSV instead: {csv_file_path}")
+                    return csv_file_path
+                except Exception as csv_e:
+                    logger.error(f"Failed to export data to CSV: {str(csv_e)}")
+                    return ""
+            else:
+                logger.warning(f"Failed with {engine} engine, trying another: {str(e)}")
+
+    return ""
 
 
 def setup_logging(

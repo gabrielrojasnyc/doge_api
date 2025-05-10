@@ -6,15 +6,11 @@ Client for interacting with the DOGE (Department of Government Efficiency) API
 """
 
 # Standard library imports
-import json
 import logging
-import os
 import time
-from datetime import datetime
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any
 
 # Third-party imports
-import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
@@ -79,6 +75,7 @@ class DogeApiClient:
         method: str = "GET",
         params: Optional[Dict] = None,
         data: Optional[Dict] = None,
+        paginate: bool = True,
     ) -> List[Dict]:
         """
         Make a request to the DOGE API
@@ -88,6 +85,7 @@ class DogeApiClient:
             method: HTTP method (default: "GET")
             params: Query parameters
             data: Request body for POST requests
+            paginate: Whether to automatically fetch all pages (default: True)
 
         Returns:
             List of dictionaries containing API response data
@@ -99,86 +97,128 @@ class DogeApiClient:
         if not endpoint.startswith("/"):
             endpoint = f"/{endpoint}"
 
-        # Construct full URL with API version if available
-        if self.api_version:
-            url = f"{self.base_url}/{self.api_version}{endpoint}"
-        else:
-            url = f"{self.base_url}{endpoint}"
+        # Construct full URL (no version prefix needed as per API Structure Notes)
+        url = f"{self.base_url}{endpoint}"
+
+        # Initialize params dict if None
+        if params is None:
+            params = {}
+
+        # Copy params to avoid modifying the original
+        params_copy = params.copy()
+
+        # Default pagination parameters if not specified
+        if paginate and "per_page" not in params_copy:
+            params_copy["per_page"] = config.BATCH_SIZE
+
+        # For pagination tracking
+        current_page = 1
+        total_pages = 1
+        all_results = []
 
         logger.debug(f"Making {method} request to {url}")
 
-        try:
-            start_time = time.time()
+        while current_page <= total_pages:
+            # Update page parameter for pagination
+            if paginate:
+                params_copy["page"] = current_page
+                
+            try:
+                start_time = time.time()
 
-            if method.upper() == "GET":
-                response = self.session.get(url, params=params, timeout=self.timeout)
-            elif method.upper() == "POST":
-                response = self.session.post(url, params=params, json=data, timeout=self.timeout)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
+                if method.upper() == "GET":
+                    response = self.session.get(url, params=params_copy, timeout=self.timeout)
+                elif method.upper() == "POST":
+                    response = self.session.post(url, params=params_copy, json=data, timeout=self.timeout)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
 
-            elapsed = time.time() - start_time
-            logger.debug(f"Request completed in {elapsed:.2f}s with status {response.status_code}")
+                elapsed = time.time() - start_time
+                logger.debug(f"Request completed in {elapsed:.2f}s with status {response.status_code}")
 
-            # Raise exception for HTTP errors
-            response.raise_for_status()
+                # Raise exception for HTTP errors
+                response.raise_for_status()
 
-            # Parse JSON response
-            json_data = response.json()
+                # Parse JSON response
+                json_data = response.json()
 
-            # Extract data from response based on DOGE API format
-            if "result" in json_data:
-                result = json_data["result"]
+                # Process pagination metadata if available
+                if "meta" in json_data and paginate:
+                    meta = json_data.get("meta", {})
+                    if "pages" in meta:
+                        total_pages = meta["pages"]
+                    elif "total_pages" in meta:
+                        total_pages = meta["total_pages"]
+                    
+                    logger.debug(f"Pagination: Page {current_page} of {total_pages}")
+                
+                # Extract data from response based on DOGE API format
+                page_results = []
+                
+                if "result" in json_data:
+                    result = json_data["result"]
 
-                # Handle nested structure in DOGE API
-                if isinstance(result, dict):
-                    # Extract data type from endpoint (e.g., "grants" from "/savings/grants")
-                    endpoint_parts = endpoint.strip("/").split("/")
-                    if len(endpoint_parts) >= 2:
-                        data_type = endpoint_parts[-1]
-                        if data_type in result and isinstance(result[data_type], list):
-                            return result[data_type]
+                    # Handle nested structure in DOGE API
+                    if isinstance(result, dict):
+                        # Extract data type from endpoint (e.g., "grants" from "/savings/grants")
+                        endpoint_parts = endpoint.strip("/").split("/")
+                        if len(endpoint_parts) >= 2:
+                            data_type = endpoint_parts[-1]
+                            if data_type in result and isinstance(result[data_type], list):
+                                page_results = result[data_type]
 
-                    # If we can't extract by endpoint name, find the first list value
-                    for key, value in result.items():
-                        if isinstance(value, list):
-                            logger.debug(f"Returning list from result[{key}]")
-                            return value
+                        # If we can't extract by endpoint name, find the first list value
+                        if not page_results:
+                            for key, value in result.items():
+                                if isinstance(value, list):
+                                    logger.debug(f"Returning list from result[{key}]")
+                                    page_results = value
+                                    break
 
-                # Direct list in result field
-                elif isinstance(result, list):
-                    return result
+                    # Direct list in result field
+                    elif isinstance(result, list):
+                        page_results = result
 
-            # Legacy format support
-            elif "data" in json_data and isinstance(json_data["data"], list):
-                return json_data["data"]
-            elif isinstance(json_data, list):
-                return json_data
+                # Legacy format support
+                elif "data" in json_data and isinstance(json_data["data"], list):
+                    page_results = json_data["data"]
+                elif isinstance(json_data, list):
+                    page_results = json_data
+                
+                # Add results from this page to our collection
+                all_results.extend(page_results)
+                
+                # If no items or no pagination, exit the loop
+                if not paginate or not page_results:
+                    break
+                
+                # Move to next page
+                current_page += 1
+                
+            except requests.exceptions.ConnectionError as e:
+                error_msg = f"Connection error while accessing {url}: {str(e)}"
+                logger.error(error_msg)
+                raise ConnectionError(error_msg)
+            except requests.exceptions.Timeout as e:
+                error_msg = f"Request timed out after {self.timeout}s while accessing {url}: {str(e)}"
+                logger.error(error_msg)
+                raise TimeoutError(error_msg)
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code if hasattr(e, "response") else "unknown"
+                error_msg = f"HTTP error {status_code} while accessing {url}: {str(e)}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            except requests.exceptions.RequestException as e:
+                error_msg = f"API request failed for {url}: {str(e)}"
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+        
+        if paginate and total_pages > 1:
+            logger.info(f"Retrieved {len(all_results)} records across {total_pages} pages")
+        
+        return all_results
 
-            # If we can't extract structured data, log warning and return full response
-            logger.warning("Could not extract structured data from response")
-            logger.debug(f"Response keys: {list(json_data.keys())}")
-            return [json_data]
-
-        except requests.exceptions.ConnectionError as e:
-            error_msg = f"Connection error while accessing {url}: {str(e)}"
-            logger.error(error_msg)
-            raise ConnectionError(error_msg)
-        except requests.exceptions.Timeout as e:
-            error_msg = f"Request timed out after {self.timeout}s while accessing {url}: {str(e)}"
-            logger.error(error_msg)
-            raise TimeoutError(error_msg)
-        except requests.exceptions.HTTPError as e:
-            status_code = e.response.status_code if hasattr(e, "response") else "unknown"
-            error_msg = f"HTTP error {status_code} while accessing {url}: {str(e)}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-        except requests.exceptions.RequestException as e:
-            error_msg = f"API request failed for {url}: {str(e)}"
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
-
-    def get_department_data(self, **filters) -> List[Dict]:
+    def get_department_data(self, **filters: Any) -> List[Dict]:
         """
         Get department data from the API
 
@@ -190,7 +230,7 @@ class DogeApiClient:
         """
         return self._make_request("/departments", params=filters)
 
-    def get_employee_data(self, **filters) -> List[Dict]:
+    def get_employee_data(self, **filters: Any) -> List[Dict]:
         """
         Get employee data from the API
 
@@ -202,7 +242,7 @@ class DogeApiClient:
         """
         return self._make_request("/employees", params=filters)
 
-    def get_budget_data(self, **filters) -> List[Dict]:
+    def get_budget_data(self, **filters: Any) -> List[Dict]:
         """
         Get budget data from the API
 
@@ -214,7 +254,7 @@ class DogeApiClient:
         """
         return self._make_request("/budget", params=filters)
 
-    def get_efficiency_metrics(self, **filters) -> List[Dict]:
+    def get_efficiency_metrics(self, **filters: Any) -> List[Dict]:
         """
         Get efficiency metrics from the API
 
@@ -226,7 +266,7 @@ class DogeApiClient:
         """
         return self._make_request("/metrics/efficiency", params=filters)
 
-    def get_projects_data(self, **filters) -> List[Dict]:
+    def get_projects_data(self, **filters: Any) -> List[Dict]:
         """
         Get projects data from the API
 
@@ -238,7 +278,7 @@ class DogeApiClient:
         """
         return self._make_request("/projects", params=filters)
 
-    def get_grants_data(self, **filters) -> List[Dict]:
+    def get_grants_data(self, **filters: Any) -> List[Dict]:
         """
         Get savings grants data from the API
 
@@ -250,7 +290,7 @@ class DogeApiClient:
         """
         return self._make_request("/savings/grants", params=filters)
 
-    def get_contracts_data(self, **filters) -> List[Dict]:
+    def get_contracts_data(self, **filters: Any) -> List[Dict]:
         """
         Get savings contracts data from the API
 
@@ -262,7 +302,7 @@ class DogeApiClient:
         """
         return self._make_request("/savings/contracts", params=filters)
 
-    def get_leases_data(self, **filters) -> List[Dict]:
+    def get_leases_data(self, **filters: Any) -> List[Dict]:
         """
         Get savings leases data from the API
 
@@ -296,7 +336,7 @@ class DogeApiClient:
         # Save to Excel using utility function
         return save_to_excel(df, filename, sheet_name)
 
-    def export_all_data(self, **filters) -> Dict[str, str]:
+    def export_all_data(self, **filters: Any) -> Dict[str, str]:
         """
         Export all available data types to Excel
 
