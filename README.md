@@ -2,6 +2,8 @@
 
 This tool allows you to interact with the DOGE (Department of Government Efficiency) API and export data to Excel files.
 
+![Video](/assets/Video_Ready_Saving_Money.gif)
+
 ## Overview
 
 The DOGE API provides access to government efficiency and savings data, including:
